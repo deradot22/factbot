@@ -1,0 +1,41 @@
+services:
+  - type: web
+    name: factbot
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 2 -b 0.0.0.0:$PORT app:app
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: CRON_SECRET
+        generateValue: true
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: DATA_FILE
+        value: /tmp/factbot.json
+      - key: DAILY_PICKS
+        value: "3"
+      - key: COOLDOWN_DAYS
+        value: "5"
+
+  - type: cron
+    name: factbot-daily
+    runtime: python
+    plan: free
+    region: oregon
+    schedule: "0 1 * * *"
+    buildCommand: pip install requests==2.32.3
+    startCommand: python send_daily.py
+    envVars:
+      - key: CRON_SECRET
+        fromService:
+          type: web
+          name: factbot
+          envVarKey: CRON_SECRET
+      - key: WEBHOOK_BASE_URL
+        sync: false
