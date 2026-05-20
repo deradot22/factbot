@@ -3,7 +3,7 @@ import json
 import random
 import logging
 from pathlib import Path
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 
 import requests
 from flask import Flask, request, jsonify, abort
@@ -25,6 +25,9 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 DATA_FILE = Path(os.environ.get("DATA_FILE", "factbot.json"))
 DAILY_PICKS = int(os.environ.get("DAILY_PICKS", "3"))
 COOLDOWN_DAYS = int(os.environ.get("COOLDOWN_DAYS", "5"))
+MSG_TTL_HOURS = int(os.environ.get("MSG_TTL_HOURS", "36"))
+MSG_MAX = int(os.environ.get("MSG_MAX", "100"))
+MSG_TEXT_MAX = int(os.environ.get("MSG_TEXT_MAX", "200"))
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -167,6 +170,18 @@ def lookup_trait(name):
     return None
 
 
+def store_message(chat_state, user_id, name, text):
+    msgs = chat_state.setdefault("messages", [])
+    msgs.append({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "user_id": str(user_id),
+        "name": name,
+        "text": text[:MSG_TEXT_MAX],
+    })
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=MSG_TTL_HOURS)).isoformat()
+    chat_state["messages"] = [m for m in msgs if m.get("ts", "") >= cutoff][-MSG_MAX:]
+
+
 def generate_fact(name, others=None, avoid=None):
     if anthropic is None:
         return f"[нет ANTHROPIC_API_KEY в .env — фейковый факт] Утром {name} проснулся пельменем."
@@ -228,6 +243,52 @@ def generate_fact(name, others=None, avoid=None):
     return msg.content[0].text.strip()
 
 
+CTX_SYSTEM_PROMPT = SYSTEM_PROMPT + (
+    "\n\n=== ОСОБЫЙ РЕЖИМ: ФАКТ ПО МОТИВАМ РЕАЛЬНОГО ЧАТА ===\n"
+    "Тебе сейчас дадут реальные сообщения из чата за последние сутки. "
+    "Твоя задача: найти ЛЮБОЙ цепляющий момент (оговорку, спор, обсуждение похода, "
+    "странную тему, мем, обсёрку, фейл, чей-то план) и сделать ОДИН кринж-факт "
+    "по мотивам этого. Используй имена авторов реальных сообщений. "
+    "Можно слегка преувеличить или выдумать продолжение в духе.\n\n"
+    "ЕСЛИ в сообщениях ничего стоящего нет (просто «ок», «привет», «понял», "
+    "пара слов без сюжета) — выведи РОВНО строку:\n"
+    "SKIP\n"
+    "и больше ничего. Не выдавливай факт из ничего.\n\n"
+    "Формат факта (если делаешь) — тот же: одно предложение 8-18 слов, "
+    "сухая констатация, БЕЗ панча и БЕЗ продолжения, без цитат из чата."
+)
+
+
+def generate_contextual_fact(messages_list):
+    """Возвращает строку факта или None если нет темы."""
+    if anthropic is None or not messages_list:
+        return None
+    chat_text = "\n".join(f"{m['name']}: {m['text']}" for m in messages_list)
+    log.info("contextual: %d messages, %d chars", len(messages_list), len(chat_text))
+    try:
+        msg = anthropic.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=120,
+            system=CTX_SYSTEM_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Сообщения из чата за последние сутки:\n\n"
+                    f"{chat_text}\n\n"
+                    "Сделай один факт по мотивам или выведи SKIP."
+                )
+            }],
+        )
+        text = msg.content[0].text.strip()
+    except Exception:
+        log.exception("contextual fact API error")
+        return None
+    if text.upper().startswith("SKIP"):
+        log.info("contextual: SKIP")
+        return None
+    return text
+
+
 def pick_participants(chat_state, n):
     pool = [(uid, p) for uid, p in chat_state["participants"].items() if not p.get("skip")]
     if not pool:
@@ -258,6 +319,17 @@ def run_for_chat(chat_id):
 
     lines = []
     today = date.today().isoformat()
+
+    # Контекстный факт по мотивам реального чата (если есть о чём)
+    msgs = chat_state.get("messages", [])[-30:]
+    unique_authors = {m.get("user_id") for m in msgs}
+    if len(msgs) >= 5 and len(unique_authors) >= 2:
+        ctx_fact = generate_contextual_fact(msgs)
+        if ctx_fact:
+            lines.append(ctx_fact)
+            history.append({"date": today, "user_id": "ctx", "fact": ctx_fact})
+            picks = picks[:-1] if len(picks) > 1 else picks  # один обычный заменяем контекстным
+
     for uid, p in picks:
         others_pool = [n for n in all_active if n != p["name"]]
         others = random.sample(others_pool, min(3, len(others_pool)))
@@ -339,6 +411,8 @@ def handle_update(update):
 
     p = chat_state["participants"].setdefault(user_id, {"name": name, "skip": False})
     p["name"] = name
+    if text:
+        store_message(chat_state, user_id, name, text)
     save_data(data)
 
 
