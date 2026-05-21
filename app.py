@@ -29,14 +29,45 @@ MSG_TTL_HOURS = int(os.environ.get("MSG_TTL_HOURS", "36"))
 MSG_MAX = int(os.environ.get("MSG_MAX", "100"))
 MSG_TEXT_MAX = int(os.environ.get("MSG_TEXT_MAX", "200"))
 
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "")
+USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_SECRET_KEY)
+
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 app = Flask(__name__)
 anthropic = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
-log.info("startup: anthropic=%s, data_file=%s", "configured" if anthropic else "MISSING", DATA_FILE)
+log.info(
+    "startup: anthropic=%s, storage=%s",
+    "configured" if anthropic else "MISSING",
+    f"supabase({SUPABASE_URL})" if USE_SUPABASE else f"file({DATA_FILE})",
+)
+
+
+def _sb_headers():
+    return {
+        "apikey": SUPABASE_SECRET_KEY,
+        "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
+        "Content-Type": "application/json",
+    }
 
 
 def load_data():
+    if USE_SUPABASE:
+        try:
+            r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/chat_state",
+                headers=_sb_headers(),
+                params={"select": "chat_id,state"},
+                timeout=15,
+            )
+            if r.ok:
+                rows = r.json()
+                return {"chats": {row["chat_id"]: row["state"] for row in rows}}
+            log.warning("supabase load %s: %s", r.status_code, r.text[:200])
+        except requests.RequestException:
+            log.exception("supabase load exception")
+        return {"chats": {}}
     if DATA_FILE.exists():
         try:
             return json.loads(DATA_FILE.read_text(encoding="utf-8"))
@@ -46,6 +77,22 @@ def load_data():
 
 
 def save_data(data):
+    if USE_SUPABASE:
+        chats = data.get("chats", {})
+        for chat_id, state in chats.items():
+            try:
+                r = requests.post(
+                    f"{SUPABASE_URL}/rest/v1/chat_state",
+                    headers={**_sb_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"},
+                    params={"on_conflict": "chat_id"},
+                    json={"chat_id": str(chat_id), "state": state},
+                    timeout=15,
+                )
+                if not r.ok:
+                    log.warning("supabase save chat=%s %s: %s", chat_id, r.status_code, r.text[:200])
+            except requests.RequestException:
+                log.exception("supabase save exception chat=%s", chat_id)
+        return
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = DATA_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
